@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Corre typecheck + tests sobre Node directamente. Es el feedback rápido:
+  # los tests del parser RSC son puros (sin browser ni red), así que no hace
+  # falta la imagen de Playwright para validarlos.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  # Valida que la imagen de producción realmente construya. El stage `test` del
+  # Dockerfile vuelve a correr typecheck+tests dentro de la imagen de Playwright,
+  # que es donde corre en serio.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build stage de test
+        run: docker build --target test -t poket-paylink-svc:test .
+      - name: Build imagen de runtime
+        run: docker build -t poket-paylink-svc:ci .

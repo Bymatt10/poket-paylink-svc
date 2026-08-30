@@ -1,0 +1,106 @@
+# Compose de PRODUCCIÓN — ENDURECIDO.
+#
+# Usa una imagen ya construida (image: ${IMAGE}:${IMAGE_TAG}), no `build:`.
+# Tu pipeline de despliegue debe escribir un .env junto a este archivo con
+# IMAGE/IMAGE_TAG + los secretos, y correr `docker compose up -d`.
+#
+# Postura de seguridad:
+#   - SIN puerto publicado al host: el servicio NO es visible desde el server ni
+#     la LAN. El consumidor (otro contenedor) lo alcanza por la red `edge`
+#     usando el nombre DNS `poket-paylink-svc:8080`.
+#   - Redis vive en una red `backend` interna (internal: true): sin salida a
+#     internet y sin ser alcanzable por el consumidor. Solo el svc le habla.
+#   - Filesystem read-only, todas las capabilities dropeadas, no-new-privileges,
+#     y límites de CPU/memoria/PIDs para acotar un runaway o un abuso.
+services:
+  poket-paylink-svc:
+    image: ${IMAGE}:${IMAGE_TAG}
+    restart: unless-stopped
+    init: true        # reap de zombies de Chromium
+    ipc: host         # /dev/shm de Chromium
+    env_file: .env    # POKET_USER, POKET_CODE, POKET_SVC_API_KEY, REDIS_PASSWORD, ...
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      HEADLESS: "true"
+      # Redis con contraseña, por la red interna. Sobreescribe el REDIS_URL del .env.
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+
+    # --- Endurecimiento del contenedor -------------------------------------
+    # Raíz de solo-lectura: nada puede escribir en la imagen en runtime.
+    read_only: true
+    # Chromium/Playwright necesitan escribir su perfil temporal y caché.
+    # Estos tmpfs son efímeros (viven en RAM, se borran al reiniciar) y su
+    # tamaño queda acotado por mem_limit del contenedor.
+    tmpfs:
+      - /tmp
+      - /home/pwuser
+    security_opt:
+      - no-new-privileges:true   # un exec no puede ganar privilegios vía setuid
+    cap_drop:
+      - ALL                      # Chromium ya corre con --no-sandbox; no necesita capabilities
+    mem_limit: 2g
+    memswap_limit: 2g            # sin swap extra: mem_limit es el techo real
+    cpus: 2
+    pids_limit: 1024             # acota fork-bombs; Chromium usa muchos hilos/procesos
+    # -----------------------------------------------------------------------
+
+    networks:
+      - edge       # alcanzable por el consumidor + salida a internet (portal Poket)
+      - backend    # habla con Redis
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    # Corre directo como `redis` (no root): el entrypoint se salta su `chown /data`,
+    # que si no fallaría porque dropeamos CAP_CHOWN con cap_drop: ALL.
+    user: redis
+    restart: unless-stopped
+    # Contraseña obligatoria + SIN persistencia a disco: la sesión de Poket y las
+    # claves de idempotencia son sensibles y efímeras (TTL en Redis). No dejarlas
+    # en un volumen en disco. Al reiniciar se re-loguea; la ventana de
+    # idempotencia se reinicia (segundos). Es el trade-off elegido a favor de seguridad.
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    read_only: true
+    tmpfs:
+      - /data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 192m
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - backend   # SOLO red interna: sin internet, sin ser visible por el consumidor
+
+networks:
+  # Red de borde: el consumidor debe unirse a ella (external) para pegarle al svc.
+  #   En el compose del consumidor:
+  #     networks:
+  #       paylink-edge:
+  #         external: true
+  #   y en su servicio: networks: [paylink-edge]
+  edge:
+    name: paylink-edge
+  # Red interna: sin salida a internet. Aísla a Redis del mundo y del consumidor.
+  backend:
+    name: paylink-backend
+    internal: true
