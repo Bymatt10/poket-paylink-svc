@@ -5,7 +5,37 @@
  *
  * NUNCA loguear los valores de POKET_USER ni POKET_CODE.
  */
+import { readFileSync } from 'node:fs';
 import { z } from 'zod';
+
+/**
+ * Convención `<VAR>_FILE` de Docker/Kubernetes secrets: el CONTENIDO del archivo
+ * se usa como valor. La variable directa gana si están las dos.
+ */
+const SECRET_VARS = [
+  'POKET_USER',
+  'POKET_CODE',
+  'POKET_SVC_API_KEY',
+  'REDIS_PASSWORD',
+  'SWAGGER_PASSWORD',
+] as const;
+
+function resolveSecretFiles(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const name of SECRET_VARS) {
+    const path = out[`${name}_FILE`];
+    if (!path || out[name]) continue;
+    try {
+      // trim: los editores y `echo` dejan un \n final que rompería la comparación.
+      out[name] = readFileSync(path, 'utf8').trim();
+    } catch (e) {
+      throw new Error(
+        `No se pudo leer ${name}_FILE (${path}): ${(e as Error).message}`,
+      );
+    }
+  }
+  return out;
+}
 
 const EnvSchema = z.object({
   // Credenciales del portal (login en frío)
@@ -15,7 +45,7 @@ const EnvSchema = z.object({
 
   POKET_BASE_URL: z.string().min(1).default('https://portal.pagoconpoket.com'),
 
-  // Auth del propio servicio (usado en F4)
+  // Auth del propio servicio
   POKET_SVC_API_KEY: z.string().min(16, 'debe tener al menos 16 caracteres'),
 
   REDIS_URL: z.string().min(1).default('redis://localhost:6379'),
@@ -33,6 +63,25 @@ const EnvSchema = z.object({
   SESSION_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
   MAX_CONCURRENCY: z.coerce.number().int().positive().default(1),
 
+  /** Fusible: techo del daño si algo se descontrola (bug del consumidor, key filtrada). */
+  MAX_AMOUNT: z.coerce.number().int().positive().default(100_000),
+
+  /**
+   * Marca el `idempotencyKey` en el concepto que va al portal ("ps5 #orden-1234"),
+   * único dato nuestro que queda del lado de Poket y permite reconciliar.
+   * El concepto lo ve quien paga: apagalo si tus claves son sensibles.
+   */
+  CONCEPT_MARKER: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+
+  /** Archivo JSONL de auditoría. Sin él, el rastro va solo al log de stdout. */
+  AUDIT_LOG_PATH: z.string().optional(),
+
+  /** TTL de los jobs del modo asíncrono en Redis. */
+  JOB_TTL_SECONDS: z.coerce.number().int().positive().default(86_400),
+
   // Playwright
   HEADLESS: z
     .enum(['true', 'false'])
@@ -49,7 +98,7 @@ let cached: Config | null = null;
 /** Carga y valida la config una sola vez. Lanza si algo falta/está mal. */
 export function loadConfig(): Config {
   if (cached) return cached;
-  const parsed = EnvSchema.safeParse(process.env);
+  const parsed = EnvSchema.safeParse(resolveSecretFiles(process.env));
   if (!parsed.success) {
     // Reportar qué variables fallan, SIN imprimir sus valores.
     const issues = parsed.error.issues

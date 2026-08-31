@@ -42,14 +42,15 @@ verde con `POST /v1/paylinks` devolviendo `502 rsc_parse_error` o `504`.
 
 ### Puntos de entrada concretos
 
-- **Escalar horizontalmente.** Hoy el mutex de login es por proceso, así que no
-  se puede correr más de una réplica. Un lock distribuido en Redis lo
-  destrabaría, y con eso el servicio deja de ser un punto único de falla.
-- **La key de idempotencia se libera ante cualquier fallo.** Si el fallo fue un
-  timeout *después* de disparar el POST del Server Action, el enlace pudo
-  haberse creado igual y el reintento acuña un segundo. Distinguir "falló antes
-  de disparar" de "falló después" evitaría enlaces huérfanos en el portal.
-  Ver `src/paylinkService.ts`.
+- **Escalar horizontalmente.** El mutex de login es por proceso, así que no se
+  puede correr más de una réplica: dos se pisarían los logins. Un lock
+  distribuido en Redis lo destrabaría y sacaría el punto único de falla. El modo
+  asíncrono ya existe, pero por sí solo **no** resuelve esto.
+- **Detectar si el POST llegó a dispararse.** Ante un fallo, la clave de
+  idempotencia se libera para permitir reintentos; si el fallo ocurrió después
+  del POST, el enlace puede existir igual. Hoy se mitiga con la marca en el
+  concepto (reconciliación manual). Distinguir "falló antes" de "falló después"
+  lo resolvería de raíz. Ver `src/paylinkService.ts`.
 - **Exponer `maxUsages` y `expirationDate`.** Ambos son editables en el paso 2
   del wizard (ver `SELECTORS.md`), pero la API todavía no los ofrece.
 - **Código de país distinto de +505.** El driver asume el default; falta
@@ -63,14 +64,17 @@ Más detalle en la sección "Pendientes" de [`SELECTORS.md`](./SELECTORS.md).
 ## Estilo
 
 - TypeScript estricto; `npm run typecheck` tiene que pasar.
-- **Los comentarios explican el porqué, no el qué.** Buena parte del código son
-  workarounds no obvios contra el portal (la máscara de react-aria, la
-  hidratación que se come caracteres, el listener que va antes del click). Si
-  agregás uno, explicá qué pasa si no está — es lo que evita que el próximo lo
-  "simplifique" y rompa el cobro.
-- Nada de `console.log` en el código del servicio: usá el `logger` (pino).
+- **Pocos comentarios, y solo donde el porqué no se deduce del código.** El
+  código contra el portal tiene workarounds no obvios (la máscara de react-aria,
+  la hidratación que se come caracteres, el listener que va antes del click):
+  ahí un comentario evita que alguien lo "simplifique" y rompa el cobro. En el
+  resto, que hable el código.
+- Nada de `console.log` en el servicio: usá el `logger` (pino).
 - **Nunca loguees `POKET_USER`, `POKET_CODE` ni la API key.** El body RSC crudo
   se loguea solo cuando el parseo falla, nunca en el happy path.
+- Errores tipados, no strings: cada fallo esperable tiene su clase y su entrada
+  en `mapError` (`src/server.ts`), para que el modo síncrono y el asíncrono
+  devuelvan el mismo contrato.
 
 ## Pull requests
 

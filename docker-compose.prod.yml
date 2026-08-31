@@ -58,25 +58,31 @@ services:
     # que si no fallaría porque dropeamos CAP_CHOWN con cap_drop: ALL.
     user: redis
     restart: unless-stopped
-    # Contraseña obligatoria + SIN persistencia a disco: la sesión de Poket y las
-    # claves de idempotencia son sensibles y efímeras (TTL en Redis). No dejarlas
-    # en un volumen en disco. Al reiniciar se re-loguea; la ventana de
-    # idempotencia se reinicia (segundos). Es el trade-off elegido a favor de seguridad.
+    # PERSISTENCIA: decisión explícita, no efecto colateral del hardening.
+    # AOF everysec activado porque las claves de idempotencia son la defensa
+    # contra el doble cobro: un restart que las borra reintroduce el fallo que
+    # se quería evitar. Costo: el volumen guarda también el storageState de la
+    # sesión de Poket, que es material de autenticación — protegelo como al .env
+    # y excluilo (o cifralo) en los backups que salgan del host.
+    # Trade-off inverso: --appendonly no + tmpfs en /data.
     command:
       - redis-server
       - --requirepass
       - ${REDIS_PASSWORD}
-      - --save
-      - ""
       - --appendonly
-      - "no"
+      - "yes"
+      - --appendfsync
+      - everysec
       - --maxmemory
       - 128mb
+      # noeviction: preferimos que Redis RECHACE escrituras a que descarte
+      # claves de idempotencia silenciosamente bajo presión de memoria. Un
+      # error visible es mejor que un doble cobro invisible.
       - --maxmemory-policy
-      - allkeys-lru
+      - noeviction
     read_only: true
-    tmpfs:
-      - /data
+    volumes:
+      - redis-data:/data
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -104,3 +110,8 @@ networks:
   backend:
     name: paylink-backend
     internal: true
+
+volumes:
+  # Contiene el AOF de Redis: claves de idempotencia Y la sesión de Poket.
+  # Es material sensible — ver la nota de persistencia en el servicio `redis`.
+  redis-data:

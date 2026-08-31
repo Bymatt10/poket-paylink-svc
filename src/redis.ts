@@ -10,6 +10,7 @@ import { loadConfig } from './config';
 export const REDIS_KEYS = {
   sessionState: 'poket:session:state',
   idem: (key: string) => `poket:idem:${key}`,
+  job: (jobId: string) => `poket:job:${jobId}`,
 } as const;
 
 let client: Redis | null = null;

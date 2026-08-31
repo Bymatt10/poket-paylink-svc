@@ -243,61 +243,105 @@ async function typeVerified(
   throw new Error(`No se pudo escribir "${text}" en el campo tras 3 intentos`);
 }
 
+/**
+ * Navega al wizard, rellena el paso 1 y avanza al paso 2, **sin confirmar**.
+ *
+ * Vive aparte porque lo comparten la creación real y {@link selfTest}: si el
+ * chequeo de salud recorriera un camino propio, podría pasar en verde mientras
+ * el camino que sí cobra está roto. Todo lo que puede romperse cuando Poket
+ * cambia el front —la detección de sesión, la hidratación, el tecleo del
+ * concepto, la máscara del monto, el botón Continuar— pasa por acá.
+ */
+async function openWizardAtStepTwo(
+  page: import('playwright').Page,
+  input: CreatePaylinkInput,
+): Promise<void> {
+  const cfg = loadConfig();
+  const c = createPaylinkSelectors(page);
+  const l = loginSelectors(page);
+
+  await page.goto(URLS.createPaylink(cfg.POKET_BASE_URL), {
+    waitUntil: 'domcontentloaded',
+    timeout: 20_000,
+  });
+
+  // Detectar sesión vencida ANTES de tocar el form / disparar el POST.
+  try {
+    await c.concept.waitFor({ state: 'visible', timeout: 10_000 });
+  } catch (e) {
+    const onLogin =
+      !page.url().includes('/create-paylink') ||
+      (await l.enterPoketBtn.isVisible().catch(() => false)) ||
+      (await l.phoneOrEmail.isVisible().catch(() => false));
+    if (onLogin) throw new SessionExpiredError();
+    throw e;
+  }
+
+  // Esperar a que el form hidrate: si se teclea demasiado pronto se pierden
+  // los primeros caracteres del concepto.
+  await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  // --- Paso 1: concepto + monto (keystrokes reales; react-aria + máscara) ---
+  // Concepto: tecleo verificado (la hidratación puede comerse los primeros chars).
+  await typeVerified(page, c.concept, input.description);
+
+  // Monto: arranca en "0"; seleccionar para reemplazar, y el NumberField de
+  // react-aria confirma/valida el valor al perder foco (Tab).
+  await c.amount.click();
+  await c.amount.selectText().catch(() => {});
+  await c.amount.pressSequentially(String(input.amount), { delay: 60 });
+  await page.keyboard.press('Tab');
+
+  // Assert del monto mostrado antes de continuar: nunca confirmar un monto que
+  // no coincide con lo pedido.
+  const shown = await c.amount.inputValue();
+  const shownNum = Number(shown.replace(/[^\d.]/g, ''));
+  if (!Number.isFinite(shownNum) || Math.round(shownNum) !== input.amount) {
+    throw new Error(
+      `El monto mostrado ("${shown}") no coincide con ${input.amount}; se aborta antes de confirmar`,
+    );
+  }
+
+  // Continuar → paso 2. Esperar que el botón habilite (react-aria valida async).
+  await c.continueBtn.waitFor({ state: 'visible', timeout: 10_000 });
+  await c.continueBtn.click({ timeout: 15_000 });
+}
+
+/**
+ * Recorre el wizard hasta el paso 2 y se detiene **sin tocar "Confirmar"**, que
+ * es el único click que acuña un cobro. Valida en vivo lo que `/healthz` no
+ * puede: que la sesión sirva, que los selectores matcheen, que la hidratación y
+ * la máscara del monto sigan comportándose igual, y que el botón de confirmar
+ * exista donde se espera.
+ *
+ * Pensado para correr en cron: te enterás de que Poket cambió el front antes de
+ * que falle el cobro de un cliente real, no después.
+ */
+export async function selfTest(): Promise<{ ok: true; ms: number }> {
+  const started = Date.now();
+  const ctx = await ensureSession();
+  const page = await ctx.newPage();
+  try {
+    await openWizardAtStepTwo(page, { description: 'selftest', amount: 1 });
+    // Última verificación: el botón que dispararía el cobro está presente.
+    // NO se hace click. Acá termina el selftest.
+    const c = createPaylinkSelectors(page);
+    await c.confirmBtn.waitFor({ state: 'visible', timeout: 10_000 });
+    return { ok: true, ms: Date.now() - started };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
 /** Un intento de creación (sin lógica de reintento). */
 async function attemptCreate(input: CreatePaylinkInput): Promise<PaylinkData> {
-  const cfg = loadConfig();
   const ctx = await ensureSession();
   const page = await ctx.newPage();
   try {
     const c = createPaylinkSelectors(page);
-    const l = loginSelectors(page);
 
-    await page.goto(URLS.createPaylink(cfg.POKET_BASE_URL), {
-      waitUntil: 'domcontentloaded',
-      timeout: 20_000,
-    });
-
-    // Detectar sesión vencida ANTES de tocar el form / disparar el POST.
-    try {
-      await c.concept.waitFor({ state: 'visible', timeout: 10_000 });
-    } catch (e) {
-      const onLogin =
-        !page.url().includes('/create-paylink') ||
-        (await l.enterPoketBtn.isVisible().catch(() => false)) ||
-        (await l.phoneOrEmail.isVisible().catch(() => false));
-      if (onLogin) throw new SessionExpiredError();
-      throw e;
-    }
-
-    // Esperar a que el form hidrate: si se teclea demasiado pronto se pierden
-    // los primeros caracteres del concepto.
-    await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {});
-    await page.waitForTimeout(400);
-
-    // --- Paso 1: concepto + monto (keystrokes reales; react-aria + máscara) ---
-    // Concepto: tecleo verificado (la hidratación puede comerse los primeros chars).
-    await typeVerified(page, c.concept, input.description);
-
-    // Monto: arranca en "0"; seleccionar para reemplazar, y el NumberField de
-    // react-aria confirma/valida el valor al perder foco (Tab).
-    await c.amount.click();
-    await c.amount.selectText().catch(() => {});
-    await c.amount.pressSequentially(String(input.amount), { delay: 60 });
-    await page.keyboard.press('Tab');
-
-    // Assert del monto mostrado antes de continuar (regla del plan: nunca
-    // confirmar un monto que no coincide con lo pedido).
-    const shown = await c.amount.inputValue();
-    const shownNum = Number(shown.replace(/[^\d.]/g, ''));
-    if (!Number.isFinite(shownNum) || Math.round(shownNum) !== input.amount) {
-      throw new Error(
-        `El monto mostrado ("${shown}") no coincide con ${input.amount}; se aborta antes de confirmar`,
-      );
-    }
-
-    // Continuar → paso 2. Esperar que el botón habilite (react-aria valida async).
-    await c.continueBtn.waitFor({ state: 'visible', timeout: 10_000 });
-    await c.continueBtn.click({ timeout: 15_000 });
+    await openWizardAtStepTwo(page, input);
 
     // --- Paso 2: registrar el listener del POST ANTES de confirmar ---
     const resPromise = page.waitForResponse(

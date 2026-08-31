@@ -17,13 +17,16 @@ import { loadConfig } from './config';
 import { logger } from './logger';
 import { getBrowser, isBrowserUp, closeBrowser } from './browser';
 import { getRedis, closeRedis } from './redis';
-import { hasLiveContext } from './poket/driver';
+import { hasLiveContext, selfTest } from './poket/driver';
 import { PoketRejectedError, RscParseError } from './poket/rscParser';
 import {
+  AmountLimitError,
+  CorruptIdempotencyCacheError,
   createPaylinkService,
   drainQueue,
   IdempotencyInFlightError,
 } from './paylinkService';
+import { enqueuePaylink, getJob } from './jobs';
 
 const cfg = loadConfig();
 
@@ -128,6 +131,66 @@ type PaylinkBody = {
   idempotencyKey?: string;
 };
 
+/**
+ * Traduce cualquier fallo al contrato `{ status, error, message }`. Lo comparten
+ * el camino síncrono (que responde) y el asíncrono (que guarda el error en el
+ * job), para que un mismo fallo no tenga dos formas según cómo se pidió.
+ */
+export function mapError(err: unknown): { status: number; error: string; message: string } {
+  const e = err as Error & { validation?: unknown };
+  if (e?.validation) {
+    return { status: 400, error: 'validation_error', message: e.message };
+  }
+  if (e instanceof AmountLimitError) {
+    return { status: 400, error: 'amount_limit_exceeded', message: e.message };
+  }
+  if (e instanceof IdempotencyInFlightError) {
+    return { status: 409, error: 'idempotency_in_flight', message: e.message };
+  }
+  if (e instanceof CorruptIdempotencyCacheError) {
+    return { status: 409, error: 'idempotency_corrupt', message: e.message };
+  }
+  if (e instanceof PoketRejectedError) {
+    return { status: 502, error: 'poket_rejected', message: e.message };
+  }
+  if (e instanceof RscParseError) {
+    return {
+      status: 502,
+      error: 'rsc_parse_error',
+      message: 'No se pudo interpretar la respuesta de Poket',
+    };
+  }
+  if (e?.name === 'TimeoutError' || /Timeout \d+ms exceeded|timeout/i.test(e?.message ?? '')) {
+    return {
+      status: 504,
+      error: 'poket_timeout',
+      message: 'El portal de Poket no respondió a tiempo',
+    };
+  }
+  return { status: 500, error: 'internal_error', message: 'Error interno' };
+}
+
+const jobResponseSchema = {
+  type: 'object',
+  properties: {
+    jobId: { type: 'string' },
+    status: { type: 'string', enum: ['pending', 'done', 'error'] },
+    createdAt: { type: 'string' },
+    result: paylinkResponseSchema,
+    error: errorResponseSchema,
+  },
+} as const;
+
+const selftestResponseSchema = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    ms: { type: 'number' },
+    error: { type: 'string' },
+    message: { type: 'string' },
+  },
+} as const;
+
 export async function buildServer() {
   const app = Fastify({
     loggerInstance: logger,
@@ -223,11 +286,13 @@ export async function buildServer() {
         summary: 'Crear un enlace de pago',
         description:
           'Crea un enlace de pago en Poket y devuelve la URL pública. ' +
-          'Enviá idempotencyKey (ej. id de la orden) para evitar cobros duplicados.',
+          'Enviá idempotencyKey (ej. id de la orden) para evitar cobros duplicados. ' +
+          'Con el header `Prefer: respond-async` responde 202 + jobId en vez de esperar.',
         security: [{ apiKey: [] }],
         body: paylinkBodySchema,
         response: {
           201: paylinkResponseSchema,
+          202: jobResponseSchema,
           400: errorResponseSchema,
           401: errorResponseSchema,
           409: errorResponseSchema,
@@ -238,47 +303,98 @@ export async function buildServer() {
     },
     async (req, reply) => {
       const { description, amount, currency, idempotencyKey } = req.body;
-      const result = await createPaylinkService({
-        description,
-        amount,
-        currency,
-        idempotencyKey,
-      });
+      const input = { description, amount, currency, idempotencyKey };
+
+      // Opt-in por header: los consumidores que ya dependen de la respuesta
+      // síncrona no cambian.
+      if (/respond-async/i.test(String(req.headers['prefer'] ?? ''))) {
+        const job = await enqueuePaylink(input, (e) => {
+          const m = mapError(e);
+          return { error: m.error, message: m.message };
+        });
+        req.log.info({ jobId: job.jobId }, 'Creación encolada (async)');
+        await reply
+          .code(202)
+          .header('Location', `/v1/paylinks/jobs/${job.jobId}`)
+          .send(job);
+        return;
+      }
+
+      const result = await createPaylinkService(input);
       // Nunca loguear credenciales; sí el id del enlace y si fue reuso.
       req.log.info({ id: result.id, reused: result.reused }, 'Enlace creado');
       await reply.code(201).send(result);
     },
   );
 
+  /** Estado de una creación asíncrona; el resultado vive con TTL en Redis. */
+  app.get<{ Params: { jobId: string } }>(
+    '/v1/paylinks/jobs/:jobId',
+    {
+      schema: {
+        tags: ['paylinks'],
+        summary: 'Estado de una creación asíncrona',
+        security: [{ apiKey: [] }],
+        params: {
+          type: 'object',
+          required: ['jobId'],
+          properties: { jobId: { type: 'string' } },
+        },
+        response: { 200: jobResponseSchema, 401: errorResponseSchema, 404: errorResponseSchema },
+      },
+    },
+    async (req, reply) => {
+      const job = await getJob(req.params.jobId);
+      if (!job) {
+        await reply
+          .code(404)
+          .send({ error: 'job_not_found', message: 'Job inexistente o vencido' });
+        return;
+      }
+      await reply.code(200).send(job);
+    },
+  );
+
+  /**
+   * Chequeo profundo que NO cobra: recorre el wizard y se detiene sin confirmar.
+   * Es lo que `/healthz` no puede contestar — si Poket cambia su front, healthz
+   * sigue en verde y solo fallan las creaciones.
+   */
+  app.get(
+    '/v1/selftest',
+    {
+      schema: {
+        tags: ['ops'],
+        summary: 'Recorre el wizard sin confirmar: valida sesión y selectores',
+        description:
+          'NO crea ningún enlace: se detiene antes del botón que acuña el cobro. ' +
+          'Responde 200 si el camino completo sigue funcionando, 503 si algo se rompió.',
+        security: [{ apiKey: [] }],
+        response: { 200: selftestResponseSchema, 401: errorResponseSchema, 503: selftestResponseSchema },
+      },
+    },
+    async (req, reply) => {
+      try {
+        const { ms } = await selfTest();
+        req.log.info({ ms }, 'Selftest OK');
+        await reply.code(200).send({ ok: true, ms });
+      } catch (e) {
+        const mapped = mapError(e);
+        req.log.error({ err: (e as Error).message, ...mapped }, 'Selftest FALLÓ');
+        await reply
+          .code(503)
+          .send({ ok: false, error: mapped.error, message: mapped.message });
+      }
+    },
+  );
+
   // Mapeo de errores → contrato { error, message }.
   app.setErrorHandler((err, req, reply) => {
-    const e = err as Error & { validation?: unknown };
-    if (e.validation) {
-      reply.code(400).send({ error: 'validation_error', message: e.message });
-      return;
+    const mapped = mapError(err);
+    if (mapped.status === 500) {
+      req.log.error({ err: (err as Error).message }, 'Error no manejado');
     }
-    if (e instanceof IdempotencyInFlightError) {
-      reply.code(409).send({ error: 'idempotency_in_flight', message: e.message });
-      return;
-    }
-    if (e instanceof PoketRejectedError) {
-      reply.code(502).send({ error: 'poket_rejected', message: e.message });
-      return;
-    }
-    if (e instanceof RscParseError) {
-      reply
-        .code(502)
-        .send({ error: 'rsc_parse_error', message: 'No se pudo interpretar la respuesta de Poket' });
-      return;
-    }
-    if (e.name === 'TimeoutError' || /Timeout \d+ms exceeded|timeout/i.test(e.message)) {
-      reply
-        .code(504)
-        .send({ error: 'poket_timeout', message: 'El portal de Poket no respondió a tiempo' });
-      return;
-    }
-    req.log.error({ err: e.message }, 'Error no manejado');
-    reply.code(500).send({ error: 'internal_error', message: 'Error interno' });
+    reply.code(mapped.status).send({ error: mapped.error, message: mapped.message });
   });
 
   return app;
@@ -313,6 +429,17 @@ async function start() {
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  // Sin esto Node mata el proceso por una rejection suelta sin dejar rastro, y
+  // un servicio que acuña cobros no puede morir en silencio.
+  process.on('unhandledRejection', (reason) => {
+    logger.error({ err: reason instanceof Error ? reason.message : String(reason) },
+      'Promesa rechazada sin manejar');
+  });
+  process.on('uncaughtException', (err) => {
+    logger.fatal({ err: err.message, stack: err.stack }, 'Excepción no capturada: apagando');
+    void shutdown('uncaughtException');
+  });
 }
 
 // Arrancar solo si se ejecuta directamente (no al importar en tests).
