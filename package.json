@@ -38,7 +38,7 @@
     "create:check": "tsx src/createCheck.ts"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/node": "^26.4.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.10"
   },
