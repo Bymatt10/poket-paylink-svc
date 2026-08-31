@@ -21,6 +21,19 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  # Este servicio acuña cobros y su única barrera es la API key: una vuln en la
+  # capa HTTP no es un detalle. Falla en `high` para que se vea en el PR.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+
   # Valida que la imagen de producción realmente construya. El stage `test` del
   # Dockerfile vuelve a correr typecheck+tests dentro de la imagen de Playwright,
   # que es donde corre en serio.

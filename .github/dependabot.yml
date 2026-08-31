@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Un servicio que acuña cobros no puede quedarse con dependencias vulnerables
+  # porque nadie lo miró en tres meses.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Los parches y minors van juntos en un PR: si CI pasa, se mergea y listo.
+      # Los majors quedan sueltos porque pueden romper el driver.
+      minor-y-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
